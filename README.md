@@ -1,6 +1,6 @@
 # GCP Cloud DevOps Engineer exercise
 
-A practical exercise: improve a small existing GCP service and explain how to operate it.
+A practical assignment: improve a small existing GCP service and explain how to operate it.
 
 - [Candidate assignment](assignment/ASSIGNMENT.md) — scenario, five problems and submission requirements.
 
