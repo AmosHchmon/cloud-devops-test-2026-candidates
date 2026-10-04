@@ -25,7 +25,7 @@ A survey service accepts files, validates them and produces reports.
 | Identity | Agent uses an attached service account; application uses workload identity. No service-account key files |
 | Secrets | Secret Manager; access is already configured |
 
-The VPN, HTTPS entry point and identity setup work. You do not need to redesign them. There is no development environment to design in this exercise.
+The VPN, HTTPS entry point and identity setup work. You do not need to redesign them. There is no development environment to design in this assignment.
 
 The current pipeline checks out Git, builds images tagged `latest`, pushes them, runs a database migration and deploys to GKE. There are no pull-request checks or production approval.
 
@@ -45,7 +45,7 @@ Cloud SQL has a daily automated backup with seven-day retention. Point-in-time r
 
 At 10:20, an operator accidentally deletes survey records and several uploaded objects. The mistake is discovered at 10:35.
 
-The exercise targets are a maximum of 15 minutes of lost database changes (RPO) and service recovery within two hours (RTO). Deleted files should be recoverable for seven days.
+The task targets are a maximum of 15 minutes of lost database changes (RPO) and service recovery within two hours (RTO). Deleted files should be recoverable for seven days.
 
 Propose the changes needed before such an incident, then describe recovery in numbered steps. Cover the restore destination, database/file consistency, application reconnection and checks before reopening the service. Explain the limits of the current setup and how you would prove the improved recovery meets the targets.
 
