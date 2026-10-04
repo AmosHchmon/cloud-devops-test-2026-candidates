@@ -76,7 +76,7 @@ Propose a simple Azure DevOps pipeline flow for build, validation, production ap
 
 Explain how to recover from a failed application release and what changes when its migration is incompatible with the previous application. Do not assume redeploying an old image restores the database.
 
-Keep Azure DevOps Server as Git and CI/CD. Use GitHub only for this submission. Do not use Jenkins or replace CI/CD with GitHub Actions.
+Keep Azure DevOps Server as Git and CI/CD. Use GitHub only for this submission. Do not use Jenkins.
 
 ### 5. Git controls
 
