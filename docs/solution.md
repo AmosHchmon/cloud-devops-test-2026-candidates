@@ -1,6 +1,6 @@
 # Solution - GCP Cloud DevOps assignment
 
-> Status: in progress. Sections 1, 2 and 3 are written (stages 2-5). Other sections are filled in by later stages.
+> Status: in progress. Sections 1 to 5 are written (stages 2-6). Remaining: assumptions, time and AI disclosure. Other sections are filled in by later stages.
 > Each problem follows: cause/risk, exact fix, safe implementation, verification.
 
 ## Assumptions, tradeoffs and testing status
@@ -373,10 +373,183 @@ Finally: re-enable the agent in the pool, trigger one **test pipeline run** to c
 | End to end | Run a normal build after cleanup | Succeeds; compare build time with and without cache |
 
 ## 4. Failed release
-_TBD_ (excerpts: [pipelines/](../pipelines/))
+
+> **Status: design only.** The pipeline in [pipelines/azure-pipelines.yaml](../pipelines/azure-pipelines.yaml) was **not run** in Azure DevOps. Its YAML syntax was parsed locally (not validated against the Azure DevOps schema). Lines marked `PSEUDOCODE` are environment-specific. Git and CI/CD stay in **Azure DevOps Server**; GitHub is used only for this submission; Jenkins is not used.
+
+### Cause / risk
+
+| Problem today | Consequence |
+| --- | --- |
+| All images use `latest` | The tag moves, so nobody can say which build is running; "redeploy the old image" is impossible because the old image no longer has a name. Nodes may also run different content under the same tag. |
+| Previous deployed digest not recorded | There is no rollback target. |
+| Migration runs before the deploy and succeeds, then the API fails | The database is already on the new schema. Rolling back the application does **not** roll back the database. |
+| No pull-request checks, no production approval | Untested code reaches production automatically, from any push. |
+
+### Proposed flow
+
+```mermaid
+flowchart LR
+  PR[Pull request] -->|branch policy| V[Validate + Build, no push]
+  V -->|review + green build| M[Merge to main]
+  M --> VB[Validate + Build]
+  VB --> P[Push image, record digest]
+  P --> A{{"Approval: Environment production"}}
+  A --> BK[Pre-migration backup]
+  BK --> MG[Expand-only migration]
+  MG --> R[Rollout by digest]
+  R -->|ready| REC[Record deployed version]
+  R -->|fails| RB[Roll back app to previous digest]
+```
+
+1. **Validate** (every PR and every merge): unit tests, Dockerfile lint, Kubernetes manifest validation.
+2. **Build:** image tagged `<BuildId>-<short git sha>` (immutable, traceable to a commit). **PR builds never push.**
+3. **Push + record digest:** only for merged code on `main`. The digest (`sha256:...`) is the content hash of the image. Deployment uses `image@sha256:...`, so what was tested is exactly what runs. The digest is saved in a `release.json` pipeline artifact.
+4. **Approval:** the deployment job targets the Environment `production`. **Approvals and checks** on that Environment pause the run until an authorised approver accepts (details in section 5).
+5. **Before migration:** record the current image (rollback target) and take an on-demand Cloud SQL backup (restore point; see section 2).
+6. **Migration** as a one-off Kubernetes Job using the *new* image digest, **expand-only** (see below).
+7. **Rollout** with `kubectl set image` by digest and `rollout status` with a timeout (readiness probes and `maxUnavailable: 0` from [k8s/api-deployment.yaml](../k8s/api-deployment.yaml) keep it safe).
+8. **Record the deployed version:** cluster annotations (`ci/image`, `ci/previous-image`, `ci/build-id`, `ci/git-sha`) and a `deployed-version.json` artifact. At any time the answer to "what is running?" is a digest linked to a commit.
+
+Excerpt (full draft in [pipelines/azure-pipelines.yaml](../pipelines/azure-pipelines.yaml)):
+
+```yaml
+# Immutable tag and digest (excerpt)
+- script: |
+    SHORT_SHA="$(echo "$(Build.SourceVersion)" | cut -c1-7)"
+    echo "##vso[task.setvariable variable=imageTag]$(Build.BuildId)-${SHORT_SHA}"
+- script: |
+    docker push "$(imageRepo):$(imageTag)"
+    REPO_DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "$(imageRepo):$(imageTag)")"
+    DIGEST="${REPO_DIGEST#*@}"   # sha256:... -> written to release.json
+  condition: and(succeeded(), eq(variables.isMainCi, 'True'))
+
+# Deploy by digest, behind an Environment approval (excerpt)
+- deployment: deploy_prod
+  environment: production          # approvals and checks are configured on this Environment
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+          - script: kubectl -n survey set image deploy/survey-api api="$(newRef)"   # newRef = image@sha256:...
+```
+
+### Recovering from a failed application release
+
+Situation: the migration succeeded, the new version produces API errors.
+
+1. **Stop the damage:** the pipeline fails the rollout, or an operator detects errors. Do not start further releases.
+2. **Check migration compatibility first:** was the migration **expand-only** (backward compatible)?
+3. **If yes (normal case): roll back the application only.** Set the image to the recorded previous digest (`ci/previous-image` annotation or `deployed-version.json`), wait for `rollout status`, and verify error rate and key flows. The old code works with the expanded schema.
+4. **Then fix forward:** correct the defect in a normal PR and release it through the same pipeline.
+
+Keep in mind: **redeploying an old image does not restore the database.** The schema (and any data written by the new version) stays as it is.
+
+### When the migration is incompatible with the previous application
+
+If the new schema breaks the old application (for example a dropped or renamed column, or a new `NOT NULL` column without a default), rolling back only the application will not work. Options, in order of preference:
+
+1. **Roll forward** with a hotfix that works with the new schema (normal PR, same controls). Usually the fastest and safest.
+2. A **tested compensating migration** (a "down" script) if it is data-safe. Run it as an explicit, reviewed step; never assume it exists or is safe.
+3. **Restore** from backup or point-in-time recovery as the last resort. This loses data written after the restore point. Prefer the selective restore from section 2 (clone, then copy back only the needed rows).
+
+**Prevent it with the Expand/Contract pattern:**
+
+| Release | Schema change | Application |
+| --- | --- | --- |
+| N (expand) | Add the new column or table (nullable or defaulted). Add, never remove or rename. | Writes both old and new; reads the old |
+| N+1 | Backfill data in batches | Reads the new, still writes both |
+| N+2 (contract) | Drop the old column, only after N+1 is stable and the previous version can no longer run | Uses only the new |
+
+Rules for migrations:
+
+- Every migration must work with the **previous** application version. This also matters without rollbacks: during a rolling update old and new pods run **at the same time**.
+- No `DROP`, `RENAME` or adding `NOT NULL` without a default in the same release as the code change that needs it.
+- Set `lock_timeout` and `statement_timeout`, and run large backfills in batches to avoid long locks.
+- Take the restore point (backup / PITR timestamp) immediately before migrating, and record it in the release notes.
+- Use feature flags for risky behaviour changes, so they can be turned off without a redeploy.
+
+### Verification (proposed, not yet run)
+
+| Check | How | Pass criteria |
+| --- | --- | --- |
+| Pipeline syntax | Run in a sandbox Azure DevOps project | Stages appear; PR runs never push |
+| Digest deploy | Deploy a test image | `kubectl get deploy -o yaml` shows `image@sha256:...`, not a tag |
+| Approval gate | Run on `main` | Run waits at `production`; deploys only after approval |
+| Failure path | Deploy an image that fails readiness | Rollout fails, rollback step restores the previous digest |
+| Compatibility | Run N-1 application against the N schema in CI | Tests pass (this catches non-expand migrations) |
 
 ## 5. Git controls
-_TBD_
+
+> **Status: design only.** Policies are configured in Azure DevOps (UI or `az repos policy`); none of this was applied. CLI flags below must be verified with `--help` for the installed Azure DevOps CLI extension and Server version.
+
+### Cause / risk
+
+Developers push directly to `main`, and any push can deploy to production. There is no review, no automated check before merge, and no production authorisation. A mistake (or a compromised account) reaches production in minutes.
+
+### Lightweight workflow for a small team
+
+- **Trunk-based:** `main` is the only long-lived branch and is always releasable. Work happens in short-lived branches (`feature/*`, `hotfix/*`).
+- Every change goes through a **pull request** to `main`. The PR runs the pipeline (Validate and Build, no push). After review and a green build the PR is merged (squash, for a clean history).
+- A merge to `main` builds and pushes the image, then **waits for production approval** (section 4). Merging is not releasing.
+
+### Branch policies on `main` (Azure Repos)
+
+| Policy | Setting | Purpose |
+| --- | --- | --- |
+| Require a pull request | No direct pushes; remove **"Bypass policies when pushing"** and **"Bypass policies when completing pull requests"** from all groups, including administrators; deny force-push | Nothing reaches `main` without the other controls |
+| Minimum number of reviewers | **1** (small team); **2** for sensitive paths. Creator's own vote does not count; reset votes on new pushes | Independent review of every change |
+| Path-based required reviewers | `/pipelines/`, `/k8s/`, `/migrations/` need a named group (for example the DevOps group) | Pipeline, infrastructure and schema changes get an expert review |
+| **Build validation** | Required (blocking) policy using this pipeline; automatic trigger; expires immediately when `main` changes (valid duration 0) | Merge only with a green, up-to-date build |
+| Comment resolution | Required | No ignored review feedback |
+| Merge types | Squash only | Linear, readable history that maps one PR to one release |
+| Linked work item (optional) | Required | Traceability |
+
+Illustrative commands (**not run**):
+
+```bash
+REPO_ID=...   BUILD_ID=...
+az repos policy approver-count create --repository-id $REPO_ID --branch main \
+  --minimum-approver-count 1 --creator-vote-counts false --allow-downvotes false \
+  --reset-on-source-push true --blocking true --enabled true
+az repos policy build create --repository-id $REPO_ID --branch main \
+  --build-definition-id $BUILD_ID --display-name "PR validation" \
+  --queue-on-source-update-only false --manual-queue-only false --valid-duration 0 \
+  --blocking true --enabled true
+az repos policy comment-required create --repository-id $REPO_ID --branch main --blocking true --enabled true
+az repos policy merge-strategy create --repository-id $REPO_ID --branch main \
+  --allow-squash true --allow-no-fast-forward false --allow-rebase false \
+  --allow-rebase-merge false --blocking true --enabled true
+```
+
+### Production release authorisation (pipeline controls)
+
+On the Environment **`production`** (Pipelines > Environments > Approvals and checks):
+
+- **Approvals** from a named approver group; approvers may **not** approve their own run (so author, reviewer and releaser are not all the same person); an approval timeout.
+- **Branch control:** only deployments from `refs/heads/main` are allowed. This blocks a deployment from a feature branch even if someone edits the pipeline.
+- Optional: **Exclusive lock** (one production deployment at a time) and a business-hours check.
+- **Restrict who can change what releases:** the pipeline file is in `/pipelines/` and needs the DevOps reviewers (above); the service connection or agent identity is limited to this pipeline; secrets stay in Secret Manager and permission-restricted variable groups.
+
+### Hotfix flow
+
+An urgent fix follows the **same controls**, only faster:
+
+1. Branch `hotfix/<short-name>` from `main`. (A revert of the offending PR is often the quickest fix: `git revert` in a PR.)
+2. Open a PR to `main`. The same branch policies apply: required review (an on-call reviewer is acceptable), and the same green Build validation. **No bypass and no direct push**, even for administrators.
+3. After the merge, the same pipeline builds the image and records the digest. The **production approval is still required**, but the approver can be the on-call approver, so it takes minutes.
+4. Afterwards: a short post-incident review, and a follow-up PR for anything skipped (for example extra tests).
+
+Why not push directly in an emergency? Urgent changes are exactly when mistakes happen, and the checks (automated build, a second pair of eyes) take only minutes. A proposed fast path for pure rollbacks: re-run the pipeline with a previous recorded digest (still approved at the environment).
+
+### Verification (proposed, not yet run)
+
+| Check | How | Pass criteria |
+| --- | --- | --- |
+| Direct push blocked | `git push origin main` as a normal user and as an administrator | Rejected (policy) |
+| PR cannot merge | Open a PR with a failing test | Merge blocked until fixed and re-validated |
+| Review required | Try to approve one's own PR | Does not count |
+| Deployment gate | Merge to `main` | Pipeline waits at `production` until approved |
+| Branch control | Run the pipeline from a feature branch | Deployment stage blocked by the Environment check |
 
 ## Time spent and AI disclosure
 _TBD_ - substantial AI assistance is disclosed here (see also the README).
