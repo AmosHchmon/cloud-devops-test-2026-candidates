@@ -1,0 +1,24 @@
+flowchart LR
+  U[Users] --> LB[HTTPS Load Balancer]
+  LB --> FE[Web frontend x2+]
+  LB --> API[API x3+]
+  subgraph GKE["Regional private GKE - me-west1, 3 zones"]
+    FE
+    API
+    W[Worker x2]
+  end
+  API --> SQL[("Cloud SQL HA + PITR")]
+  W --> SQL
+  API --> GCS[("Bucket: versioning + soft delete 7d")]
+  W --> GCS
+  SQL -. backups and WAL .-> BK[(Backups)]
+  AR[Artifact Registry - immutable tags, digests] --> GKE
+  subgraph ONPREM["On-premises"]
+    ADO[Azure DevOps Server 2022]
+  end
+  subgraph GCP["GCP"]
+    AG[Self-hosted agent VM - dedicated Docker disk]
+  end
+  ADO <-->|site-to-site VPN| AG
+  AG -->|push images| AR
+  AG -->|deploy by digest via private GKE API| GKE
