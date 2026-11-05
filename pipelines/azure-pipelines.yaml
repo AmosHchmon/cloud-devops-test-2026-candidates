@@ -1,0 +1,195 @@
+# DRAFT EXCERPT - Azure DevOps Server 2022 multi-stage pipeline (Git and CI/CD stay in Azure DevOps).
+# PROPOSED ONLY: not run, not validated in an Azure DevOps organisation. Names (project, cluster,
+# environment, pool, deployment, namespace) are placeholders. Lines marked "PSEUDOCODE" are
+# environment-specific commands that must be adapted. No secrets are stored here.
+#
+# Controls that live OUTSIDE this file (see docs/solution.md, section 5):
+#   * Branch policy on main: PR required, reviewers, Build validation = this pipeline's Validate+Build stages.
+#   * Environment "production": Approvals and checks (approvers, branch control = refs/heads/main).
+#
+# Flow:  PR (policy) -> Validate -> Build (no push)            [not deployed]
+#        merge to main -> Validate -> Build -> Push (digest) -> [manual approval] -> Deploy prod
+
+trigger:
+  branches:
+    include: [main]          # only merged code can reach production. No direct pushes (branch policy).
+# Note: Azure Repos Git ignores a YAML "pr:" trigger; PR validation is configured as a
+# *build validation branch policy* that queues this pipeline.
+
+pool:
+  name: gcp-build-agents     # self-hosted Ubuntu agent in GCP (placeholder pool name)
+
+variables:
+  - group: survey-nonsecret  # non-secret settings: gcpProject, clusterName, region (placeholder)
+  - name: registry
+    value: me-west1-docker.pkg.dev
+  - name: imageRepo
+    value: $(registry)/$(gcpProject)/survey/api
+  - name: isMainCi
+    value: ${{ and(eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest')) }}
+
+stages:
+# ---------------------------------------------------------------------------
+- stage: Validate
+  displayName: Validate (tests, lint, manifests)
+  jobs:
+    - job: validate
+      steps:
+        - checkout: self
+          fetchDepth: 1
+          clean: true
+        - script: |
+            python -m pip install -r requirements.txt -r requirements-dev.txt
+            python -m pytest -q
+          displayName: Unit tests                       # assumes an app layout; adapt
+        - script: |
+            hadolint Dockerfile
+            kubeconform -strict -summary k8s/*.yaml
+          displayName: Lint Dockerfile and validate Kubernetes manifests
+
+# ---------------------------------------------------------------------------
+- stage: Build
+  displayName: Build image (push only from main)
+  dependsOn: Validate
+  jobs:
+    - job: build
+      steps:
+        - checkout: self
+          fetchDepth: 1
+          clean: true
+
+        # Immutable tag: <build id>-<short git sha>. Never "latest".
+        - script: |
+            set -euo pipefail
+            SHORT_SHA="$(echo "$(Build.SourceVersion)" | cut -c1-7)"
+            TAG="$(Build.BuildId)-${SHORT_SHA}"
+            echo "##vso[task.setvariable variable=imageTag]${TAG}"
+            echo "Image tag: ${TAG}"
+          displayName: Compute immutable image tag
+
+        - script: |
+            set -euo pipefail
+            docker build --pull \
+              --label org.opencontainers.image.revision="$(Build.SourceVersion)" \
+              --label ci.build-id="$(Build.BuildId)" \
+              -t "$(imageRepo):$(imageTag)" .
+          displayName: Docker build
+
+        # PSEUDOCODE: vulnerability scan; fail on HIGH/CRITICAL (tool choice is a team decision).
+        - script: trivy image --exit-code 1 --severity HIGH,CRITICAL "$(imageRepo):$(imageTag)"
+          displayName: Scan image (pseudocode)
+
+        # ---- Push and record the DIGEST: only for merged code on main ----
+        - script: |
+            set -euo pipefail
+            # PSEUDOCODE: the agent VM uses its attached service account (no key files).
+            gcloud auth configure-docker "$(registry)" --quiet
+            docker push "$(imageRepo):$(imageTag)"
+
+            # Digest = content hash of the pushed image. Deploy by digest, not by tag.
+            REPO_DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "$(imageRepo):$(imageTag)")"
+            DIGEST="${REPO_DIGEST#*@}"          # sha256:...
+            mkdir -p "$(Build.ArtifactStagingDirectory)"
+            cat > "$(Build.ArtifactStagingDirectory)/release.json" <<EOF
+            {
+              "image": "$(imageRepo)",
+              "tag": "$(imageTag)",
+              "digest": "${DIGEST}",
+              "gitSha": "$(Build.SourceVersion)",
+              "buildId": "$(Build.BuildId)"
+            }
+            EOF
+            cat "$(Build.ArtifactStagingDirectory)/release.json"
+          displayName: Push to Artifact Registry and record digest
+          condition: and(succeeded(), eq(variables.isMainCi, 'True'))
+
+        - task: PublishPipelineArtifact@1
+          displayName: Publish release manifest
+          condition: and(succeeded(), eq(variables.isMainCi, 'True'))
+          inputs:
+            targetPath: $(Build.ArtifactStagingDirectory)/release.json
+            artifact: release
+
+# ---------------------------------------------------------------------------
+- stage: DeployProd
+  displayName: Deploy to production (manual approval)
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables.isMainCi, 'True'))
+  jobs:
+    # A "deployment" job targets an Environment. Approvals and checks configured on the
+    # Environment "production" pause the run here until an authorised approver accepts.
+    - deployment: deploy_prod
+      displayName: Deploy API by digest
+      environment: production            # <-- approval gate (configured in Pipelines > Environments)
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: DownloadPipelineArtifact@2
+                inputs:
+                  artifact: release
+                  path: $(Pipeline.Workspace)/release
+
+              - script: |
+                  set -euo pipefail
+                  # PSEUDOCODE: private cluster; the agent reaches the API over the VPN.
+                  gcloud container clusters get-credentials "$(clusterName)" \
+                    --region "$(region)" --project "$(gcpProject)" --internal-ip
+
+                  DIGEST="$(jq -r .digest "$(Pipeline.Workspace)/release/release.json")"
+                  IMAGE="$(jq -r .image  "$(Pipeline.Workspace)/release/release.json")"
+                  echo "##vso[task.setvariable variable=newRef]${IMAGE}@${DIGEST}"
+
+                  # Record what is running NOW so a rollback target always exists.
+                  PREV="$(kubectl -n survey get deploy survey-api \
+                    -o jsonpath='{.spec.template.spec.containers[?(@.name=="api")].image}')"
+                  echo "Previous image: ${PREV}"
+                  echo "##vso[task.setvariable variable=prevRef]${PREV}"
+                displayName: Connect, resolve new digest, record previous image (pseudocode)
+
+              # PSEUDOCODE: restore point before any schema change (see section 2: PITR / on-demand backup).
+              - script: gcloud sql backups create --instance="SURVEY_DB" --project="$(gcpProject)" --description="pre-release $(Build.BuildId)"
+                displayName: Pre-migration backup (pseudocode)
+
+              # PSEUDOCODE: run migrations as a one-off Job using the NEW image digest.
+              # Only backward-compatible ("expand") migrations are allowed in a release (see section 4).
+              - script: |
+                  set -euo pipefail
+                  kubectl -n survey create job "migrate-$(Build.BuildId)" \
+                    --image="$(newRef)" -- alembic upgrade head      # assumes Alembic; adapt
+                  kubectl -n survey wait --for=condition=complete \
+                    "job/migrate-$(Build.BuildId)" --timeout=600s
+                displayName: Database migration (expand-only, pseudocode)
+
+              - script: |
+                  set -euo pipefail
+                  kubectl -n survey set image deploy/survey-api api="$(newRef)"
+                  kubectl -n survey rollout status deploy/survey-api --timeout=300s
+                displayName: Roll out by digest and wait for readiness
+
+              # Record the deployed version (cluster annotation + build artifact).
+              - script: |
+                  set -euo pipefail
+                  kubectl -n survey annotate deploy/survey-api --overwrite \
+                    ci/build-id="$(Build.BuildId)" ci/git-sha="$(Build.SourceVersion)" \
+                    ci/image="$(newRef)" ci/previous-image="$(prevRef)" \
+                    kubernetes.io/change-cause="build $(Build.BuildId) $(newRef)"
+                  mkdir -p "$(Build.ArtifactStagingDirectory)"
+                  printf '{"buildId":"%s","image":"%s","previous":"%s"}\n' \
+                    "$(Build.BuildId)" "$(newRef)" "$(prevRef)" \
+                    > "$(Build.ArtifactStagingDirectory)/deployed-version.json"
+                displayName: Record deployed version
+              - task: PublishPipelineArtifact@1
+                inputs:
+                  targetPath: $(Build.ArtifactStagingDirectory)/deployed-version.json
+                  artifact: deployed-version
+
+              # Application rollback ONLY. This does NOT undo the database migration.
+              # With expand-only migrations the previous image still works with the new schema.
+              - script: |
+                  set -euo pipefail
+                  echo "Rollout failed. Rolling the APPLICATION back to: $(prevRef)"
+                  kubectl -n survey set image deploy/survey-api api="$(prevRef)"
+                  kubectl -n survey rollout status deploy/survey-api --timeout=300s
+                displayName: Roll back application to previous digest (database is not reverted)
+                condition: failed()
