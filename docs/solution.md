@@ -1,15 +1,17 @@
 # Solution - GCP Cloud DevOps assignment
 
-> Status: in progress. Sections 1 to 5 are written (stages 2-6). Remaining: assumptions, time and AI disclosure. Other sections are filled in by later stages.
+> Status: complete (design only; see the execution status in the README).
 > Each problem follows: cause/risk, exact fix, safe implementation, verification.
 
 ## Assumptions, tradeoffs and testing status
 
-- No GCP account is used. **Everything below is "Proposed only"** unless explicitly marked **Tested locally**.
+The full list of assumptions, time spent, AI disclosure and per-item execution status is in the [README](../README.md#assumptions). In short:
+
+- **No real GCP or Azure DevOps environment was used.** Cloud and pipeline commands are pseudocode or proposals ("Proposed only"). The only local check is **YAML syntax parsing** of `k8s/` and `pipelines/`.
 - Region `me-west1` is assumed to offer three zones (`a`, `b`, `c`). Verify with `gcloud compute zones list --filter="region:me-west1"`.
-- Figures for failover time are typical, not guaranteed. They must be measured (see verification).
+- Failover, clone and recovery times are typical or estimated values and must be measured in a drill.
 - Tradeoff: three zones cost more than two (extra nodes, standby database). The extra cost buys zone-failure tolerance, which the current design lacks.
-- _More assumptions are added by later stages._
+- Other tradeoffs are stated in each section (for example selective restore vs full rollback, 7-day image cleanup, 1 reviewer for a small team).
 
 ## Architecture
 
@@ -552,4 +554,5 @@ Why not push directly in an emergency? Urgent changes are exactly when mistakes 
 | Branch control | Run the pipeline from a feature branch | Deployment stage blocked by the Environment check |
 
 ## Time spent and AI disclosure
-_TBD_ - substantial AI assistance is disclosed here (see also the README).
+
+See the [README](../README.md#time-spent): approximately 6-8 hours (candidate's estimate). **Substantial AI assistance** (Google Antigravity with the GitHub MCP server) was used for the fork and pull requests, the architecture draft, the YAML, the scripts and this document; details are in the [README AI disclosure](../README.md#ai-disclosure).
