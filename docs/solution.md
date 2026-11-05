@@ -1,6 +1,6 @@
 # Solution - GCP Cloud DevOps assignment
 
-> Status: in progress. Sections 1 and 2 are written (stages 2-4). Other sections are filled in by later stages.
+> Status: in progress. Sections 1, 2 and 3 are written (stages 2-5). Other sections are filled in by later stages.
 > Each problem follows: cause/risk, exact fix, safe implementation, verification.
 
 ## Assumptions, tradeoffs and testing status
@@ -254,7 +254,123 @@ Run a **restore drill** in a non-production project using synthetic data of prod
 - This procedure assumes the table and column names above and that the database engine, edition and limits match the assumptions; confirm against the real schema.
 
 ## 3. Linux pipeline agent failure
-_TBD_ (helper commands: [scripts/](../scripts/))
+
+> **Status: design only.** The commands and scripts below were **not run** on a real agent VM and the scripts were not tested (no Linux environment was available locally). Review and test them on a non-critical agent first.
+
+Scripts: [agent-disk-investigate.sh](../scripts/agent-disk-investigate.sh) (read-only), [agent-disk-cleanup.sh](../scripts/agent-disk-cleanup.sh) (dry run by default), and a systemd [service](../scripts/systemd/agent-disk-cleanup.service) and [timer](../scripts/systemd/agent-disk-cleanup.timer).
+
+### Cause / risk
+
+Reading the diagnostic output:
+
+| Observation | Meaning |
+| --- | --- |
+| `/` is 100G, 99G used, 0 available | The root filesystem is full, so builds fail with `No space left on device`. Docker, the agent and the OS share this one disk. |
+| `/var/lib/docker` 76G | The main consumer: images, stopped containers, volumes and build cache. Images are tagged `latest`, so every build leaves the previous image untagged (dangling) with its layers, and nothing removes them. |
+| `/opt/ado-agent/_work` 12G | Agent workspaces (checked-out sources, temp files, tool cache). Normal, but it adds up. |
+| `/var/lib/other` 4G | Unknown (simplified output); inspect before touching. |
+| 76 + 12 + 4 = 92G of 99G | About 7G is elsewhere (OS, logs such as `/var/log` or the journal, `/tmp`). Also check deleted-but-open files and inodes. |
+
+Risks: all builds and deployments stop (a delivery outage). The wrong clean-up can also delete a needed cache (slower builds), break a running job, or corrupt Docker's storage. There is no monitoring, so the first alert is the failure itself.
+
+### Investigation (read-only)
+
+```bash
+df -hT /                       # size, type, usage of the root filesystem
+df -i /                        # inode usage (also causes "No space left on device")
+sudo du -xh --max-depth=1 / 2>/dev/null | sort -rh | head -15   # -x: stay on this filesystem
+sudo du -sh /var/lib/docker/* | sort -rh                         # overlay2, containers, volumes, buildkit
+sudo docker system df          # reclaimable space by type: images, containers, volumes, build cache
+sudo docker system df -v | head -80
+sudo docker images -a --format '{{.CreatedSince}}\t{{.Size}}\t{{.Repository}}:{{.Tag}}' | head -40
+sudo docker ps -a --size                                         # stopped containers and their size
+sudo docker volume ls -f dangling=true                           # unused volumes (list only)
+sudo du -h /var/lib/docker/containers/*/*-json.log | sort -rh | head -5   # runaway container logs
+sudo journalctl --disk-usage ; sudo du -sh /var/log /tmp
+sudo lsof +L1 | head           # deleted files still held open (space not freed)
+sudo du -xh --max-depth=2 /opt/ado-agent/_work | sort -rh | head -15
+```
+
+`du -x` matters: it avoids counting other mounts. The `docker system df` "RECLAIMABLE" column shows how much each cleanup level can free before anything is deleted.
+
+### What to check before deleting anything
+
+1. **Is a job running?** `pgrep -af Agent.Worker` and `docker ps`. If a pipeline job is active, wait or let it finish. Prefer to **disable the agent in the Azure DevOps pool** (Agent pools > agent > Disable) so no new job starts during cleanup.
+2. **Is this really only a build agent?** `docker ps -a` and `docker volume ls` should show no application containers or databases. If something is a persistent service or holds data in a volume, it is not a candidate.
+3. **What is in each candidate?** Use the listing commands above. Record what will be deleted (`docker images -a > /var/tmp/images-before.txt`).
+4. **Never delete inside `/var/lib/docker` by hand** (for example `rm -rf overlay2/...`). That corrupts Docker. Always use `docker ... prune/rm`.
+5. **Delete the cheapest and safest first**, re-check `df -h /` after every step, and stop when there is enough free space (target: below 70%).
+6. Docker commands may fail while the disk is 100% full. First free a little space safely: `sudo journalctl --vacuum-size=200M`, `sudo apt-get clean`.
+
+### Safe immediate recovery (in this order)
+
+```bash
+# 0. Agent disabled in the pool; no Agent.Worker running.
+
+# 1. Stopped containers older than a day (CI containers should not need to live longer)
+sudo docker container prune -f --filter "until=24h"
+
+# 2. Dangling (untagged) images: the leftovers of "latest" re-tagging
+sudo docker image prune -f
+
+# 3. Build cache older than 7 days (recent cache is kept so builds stay fast)
+sudo docker builder prune -f --filter "until=168h"
+
+# 4. Unused images older than 7 days (not used by any container)
+sudo docker image prune -a -f --filter "until=168h"
+
+# 5. Volumes: list first, review, then remove specific ones. Not part of automatic cleanup.
+sudo docker volume ls -f dangling=true
+sudo docker volume rm VOLUME_NAME            # only after confirming it is unused scratch data
+
+df -h /                                       # confirm the result
+```
+
+Notes:
+
+- `until=168h` is based on **creation time**, not last use. A still-needed base image older than 7 days that is not used by a container at this moment may be removed. It is simply pulled again on the next build (slower build, not a failure).
+- Containers or images **in use** by a running container are never removed by prune.
+- Avoid `docker system prune -a --volumes` on a shared agent: it removes every unused image, all build cache and unused volumes in one go.
+- Agent workspace (`_work`, 12G): only when the agent is idle. `_work/_temp` and old per-pipeline folders can be removed. Keep `_work/_tool` (tool cache) unless more space is needed, since it is downloaded again.
+- If space is still not enough, escalate in this order: drop all build cache (`docker builder prune -a -f`), then consider growing the disk (see prevention) rather than deleting more.
+
+Finally: re-enable the agent in the pool, trigger one **test pipeline run** to confirm builds work, and write down what freed how much space.
+
+### Prevention
+
+1. **Automatic scheduled cleanup (systemd timer, nightly).** [agent-disk-cleanup.sh](../scripts/agent-disk-cleanup.sh) runs from the [timer](../scripts/systemd/agent-disk-cleanup.timer) at about 02:30. Behaviour: only one instance at a time (`flock`); skips if a job is running (`Agent.Worker`); stops the idle agent service while cleaning and restarts it afterwards; level 1 always (stopped containers, dangling images, old build cache, journal); level 2 above 70% (unused images older than 7 days); level 3 above 85% (all build cache). Volumes are only reported. It defaults to dry run; the service sets `DRY_RUN=0`. A cron entry works the same way, but systemd gives `Persistent=true` (catches up after downtime), logging in the journal and low I/O priority.
+2. **Docker limits**, in `/etc/docker/daemon.json`:
+
+   ```json
+   {
+     "log-driver": "json-file",
+     "log-opts": { "max-size": "50m", "max-file": "3" },
+     "builder": { "gc": { "enabled": true, "defaultKeepStorage": "30GB" } }
+   }
+   ```
+
+   This stops runaway container logs and caps BuildKit's cache. Restart Docker after changing it.
+3. **Pipeline hygiene.** Immutable tags (section 4) mean old tags can be removed deliberately. Add an `always()` step that removes the image tags built in the run, use a shallow checkout, and clean the workspace (`clean: true`) so `_work` does not grow.
+4. **Capacity design.** Put `/var/lib/docker` on a **separate data disk** (for example 200 GB, `data-root` in `daemon.json`) so a full Docker disk cannot break the OS and the agent, and the disk can be resized online. Longer term, treat the agent as disposable: rebuild it from a fresh image on a schedule (for example weekly) instead of letting state accumulate.
+5. **Fail early.** Add a first pipeline step that checks free space (for example fail if `/` is above 90% used) with a clear message, instead of failing in the middle of a build.
+
+### Monitoring and alerts
+
+- Install the **Ops Agent** on the VM (Cloud Monitoring). Use the disk metric `agent.googleapis.com/disk/percent_used` for `/` (state `used`).
+- Alert policies: **warning at 70%**, **critical at 85%** (page), a **forecast** alert when the disk is predicted to fill within 24-48 hours, and an alert when the agent is **offline** in Azure DevOps or the VM is unreachable. Inode usage deserves its own alert.
+- Send notifications to a team channel or email, and keep a short runbook link (this section) in the alert text.
+- Review the weekly trend: growth of `/var/lib/docker` shows whether the cleanup thresholds are right.
+
+### Verification (proposed, not yet run)
+
+| Check | How | Pass criteria |
+| --- | --- | --- |
+| Dry run | `DRY_RUN=1 ./agent-disk-cleanup.sh` on a test agent | Prints the planned commands; deletes nothing |
+| Cleanup effect | Fill the test disk with old images and cache, run the cleanup | Usage drops below 70%; running containers untouched |
+| Job safety | Start a long pipeline job and run the cleanup | The script skips with "pipeline job active" |
+| Timer | `systemctl list-timers`, `journalctl -u agent-disk-cleanup` | Next run is scheduled; logs show before/after usage |
+| Alerting | Temporarily lower the alert threshold | Alert is delivered to the channel |
+| End to end | Run a normal build after cleanup | Succeeds; compare build time with and without cache |
 
 ## 4. Failed release
 _TBD_ (excerpts: [pipelines/](../pipelines/))
