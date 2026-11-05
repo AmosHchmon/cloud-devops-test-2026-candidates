@@ -1,0 +1,104 @@
+# PROPOSED - not applied to a real cluster (no GCP account in this assignment).
+# API Deployment hardened for safe releases and node maintenance.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: survey-api
+  labels:
+    app: survey-api
+spec:
+  # >=3 so one pod can be lost (rollout/drain/zone) and 2 still serve.
+  # The HPA below owns the replica count at runtime.
+  replicas: 3
+  revisionHistoryLimit: 5
+  # Fail the rollout (instead of hanging) if new pods never become Ready.
+  progressDeadlineSeconds: 300
+  selector:
+    matchLabels:
+      app: survey-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # never remove a serving pod before a new one is Ready
+      maxSurge: 1         # add one new pod at a time
+  template:
+    metadata:
+      labels:
+        app: survey-api
+    spec:
+      # Must exceed preStop sleep + max in-flight request time.
+      terminationGracePeriodSeconds: 45
+      serviceAccountName: survey-api   # bound to GCP SA via Workload Identity
+      topologySpreadConstraints:
+        # Hard rule: spread across zones so a zone outage keeps >=2/3 of pods.
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: survey-api
+        # Soft rule: avoid piling pods on one node.
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: survey-api
+      containers:
+        - name: api
+          # Immutable reference; replaced by the pipeline (see stage 4). Never "latest".
+          image: me-west1-docker.pkg.dev/PROJECT_ID/survey/api@sha256:REPLACE_WITH_DIGEST
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests:        # scheduling + HPA baseline
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 512Mi  # memory limit = request headroom; no CPU limit to avoid throttling
+          # Gives slow starts up to 30 x 5s = 150s before liveness takes over.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 30
+          # Controls whether the pod receives traffic (checks DB connectivity too).
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Restarts only a hung process; must NOT depend on the database.
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Keep serving while the LB / endpoints remove this pod, then SIGTERM.
+              exec:
+                command: ["sleep", "15"]
+          # App side (assumed): on SIGTERM stop accepting, finish in-flight
+          # requests, e.g. uvicorn --timeout-graceful-shutdown 25.
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: survey-api
+  annotations:
+    # Container-native LB: NEG health checks follow the readiness probe.
+    cloud.google.com/neg: '{"ingress": true}'
+spec:
+  selector:
+    app: survey-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
