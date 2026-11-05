@@ -15,3 +15,14 @@ Seven calendar days, with a suggested effort of 6–8 hours. No GCP account, dep
 
 All data is synthetic; no secrets are stored. AI assistance is disclosed in the solution document.
 
+
+## AI usage disclosure
+
+This submission was prepared with substantial assistance from an AI coding agent (Google Antigravity). The agent used the GitHub MCP server (and local git) for:
+
+- Forking the source repository and managing branches and pull requests.
+- Reading the assignment text from the source repository.
+- Drafting the architecture proposal, Kubernetes manifests, pipeline excerpts and documentation.
+
+All content was reviewed by the candidate, who can explain the solution. No secrets or real data were used.
+
