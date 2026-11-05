@@ -1,0 +1,14 @@
+# PROPOSED - not applied to a real cluster.
+# Limits voluntary disruptions (node drain, upgrades, autoscaler scale-down).
+# Does not protect against involuntary failures such as a zone outage.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: survey-api
+spec:
+  # maxUnavailable (not minAvailable) stays valid as the HPA changes replicas.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: survey-api
+  unhealthyPodEvictionPolicy: AlwaysAllow   # a stuck NotReady pod must not block drains
