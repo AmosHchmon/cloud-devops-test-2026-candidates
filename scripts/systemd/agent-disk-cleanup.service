@@ -1,0 +1,13 @@
+# DRAFT - not installed or run anywhere.
+# Install: /etc/systemd/system/agent-disk-cleanup.service
+[Unit]
+Description=Docker cleanup for CI build agent
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=DRY_RUN=0
+ExecStart=/usr/local/bin/agent-disk-cleanup.sh
+# Run at low priority so a build is never starved.
+Nice=10
+IOSchedulingClass=idle

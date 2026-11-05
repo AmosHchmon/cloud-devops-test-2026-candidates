@@ -1,0 +1,14 @@
+# DRAFT - not installed or run anywhere.
+# Install: /etc/systemd/system/agent-disk-cleanup.timer, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now agent-disk-cleanup.timer
+[Unit]
+Description=Nightly Docker cleanup for CI build agent
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=10m
+# Run once at next boot if the VM was off at the scheduled time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
